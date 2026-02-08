@@ -1,0 +1,149 @@
+"""data_collector.py
+
+負責從 TWSE 與 TPEx 抓取當日股票資料，並將資料整理後輸出 CSV。
+提供命令列介面：可指定日期、輸出目錄，以及是否跳過 SSL 驗證 (for environments)。
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import pandas as pd
+import requests
+
+TWSE_URL = 'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={date}&type=ALL'
+TPEx_URL = 'https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={date}'
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {
+        '證券代號': '股票代號',
+        '代號': '股票代號',
+        '名稱': '股票名稱',
+        '成交股數': '成交量',
+        '成交量': '成交量',
+    }
+    cols = {c: mapping.get(c.strip(), c.strip()) for c in df.columns}
+    df = df.rename(columns=cols)
+    return df
+
+
+def fetch_twse(session: requests.Session, date_str: str, verify: bool, timeout: int = 10) -> pd.DataFrame:
+    url = TWSE_URL.format(date=date_str)
+    try:
+        resp = session.get(url, verify=verify, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+        # 移除不必要的分隔線與說明列，再用 pandas 解析
+        lines = [line for line in text.splitlines() if line and not line.startswith(('=', '"'))]
+        csv_text = '\n'.join(lines)
+        df = pd.read_csv(io.StringIO(csv_text), header=0)
+        df = df.dropna(how='all').reset_index(drop=True)
+        df = _normalize_columns(df)
+        return df
+    except Exception as e:
+        logger.warning('fetch_twse 失敗: %s', e)
+        return pd.DataFrame()
+
+
+def fetch_tpex(session: requests.Session, date_str: str, verify: bool, timeout: int = 10) -> pd.DataFrame:
+    url = TPEx_URL.format(date=date_str)
+    try:
+        resp = session.get(url, verify=verify, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get('aaData') or payload.get('data') or []
+        if not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data)
+        df = _normalize_columns(df)
+        return df
+    except Exception as e:
+        logger.warning('fetch_tpex 失敗: %s', e)
+        return pd.DataFrame()
+
+
+def fetch_data(date_str: str, verify: bool = True, timeout: int = 10) -> pd.DataFrame:
+    session = requests.Session()
+    twse_df = fetch_twse(session, date_str, verify=verify, timeout=timeout)
+    tpex_df = fetch_tpex(session, date_str, verify=verify, timeout=timeout)
+
+    if twse_df.empty and tpex_df.empty:
+        logger.info('%s 無有效數據', date_str)
+        return pd.DataFrame()
+
+    merged = pd.concat([twse_df, tpex_df], ignore_index=True, sort=False)
+
+    # 嘗試統一必要欄位
+    required = ['股票代號', '股票名稱', '開盤價', '最高價', '最低價', '收盤價', '成交量']
+    present = [c for c in required if c in merged.columns]
+    if not present:
+        logger.warning('合併後無必要欄位，欄位清單: %s', merged.columns.tolist())
+        return pd.DataFrame()
+
+    # 只保留存在的必要欄位，並補上缺少欄位為 NaN
+    for col in required:
+        if col not in merged.columns:
+            merged[col] = pd.NA
+
+    merged = merged[required]
+    merged['日期'] = date_str
+
+    # 數值欄位轉型
+    for col in ['開盤價', '最高價', '最低價', '收盤價']:
+        merged[col] = pd.to_numeric(merged[col].astype(str).str.replace(',', ''), errors='coerce')
+    merged['成交量'] = pd.to_numeric(merged['成交量'].astype(str).str.replace(',', ''), errors='coerce').fillna(0).astype('Int64')
+
+    logger.info('成功抓取 %s 的數據，共 %d 筆。', date_str, len(merged))
+    return merged
+
+
+def save_to_csv(df: pd.DataFrame, date_str: str, output_dir: Optional[str] = 'data/raw') -> Path:
+    out = Path(output_dir)
+    _ensure_dir(out)
+    file_path = out / f'stock_data_{date_str}.csv'
+    df.to_csv(file_path, index=False, encoding='utf-8-sig')
+    logger.info('數據已儲存至 %s', file_path)
+    return file_path
+
+
+def cli(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description='抓取 TWSE & TPEx 每日交易資料並輸出 CSV')
+    parser.add_argument('--date', '-d', help='日期 YYYYMMDD，預設為今日')
+    parser.add_argument('--output', '-o', default='data/raw', help='輸出資料夾')
+    parser.add_argument('--insecure', action='store_true', help='允許不驗證 SSL（僅測試用）')
+    parser.add_argument('--timeout', type=int, default=10, help='HTTP 請求超時秒數')
+    args = parser.parse_args(argv)
+
+    date_str = args.date or datetime.now().strftime('%Y%m%d')
+    verify = not args.insecure
+    if not verify:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    df = fetch_data(date_str, verify=verify, timeout=args.timeout)
+    if df.empty:
+        print('未取得任何資料。')
+        return 1
+    save_to_csv(df, date_str, output_dir=args.output)
+    return 0
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    sys.exit(cli())
