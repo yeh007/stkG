@@ -17,7 +17,7 @@ from typing import Optional
 import pandas as pd
 import requests
 
-TWSE_URL = 'https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={date}&type=ALL'
+TWSE_STOCK_DAY_URL = 'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date}&stockNo={stock_id}'
 TPEx_URL = 'https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={date}'
 
 logger = logging.getLogger(__name__)
@@ -40,22 +40,73 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_twse(session: requests.Session, date_str: str, verify: bool, timeout: int = 10) -> pd.DataFrame:
-    url = TWSE_URL.format(date=date_str)
+def fetch_twse(session: requests.Session, date_str: str, verify: bool, timeout: int = 10, stock_list: Optional[list] = None) -> pd.DataFrame:
+    """從 TWSE 官網行情 API 抓取指定日期的股票交易資料。"""
+    if stock_list is None:
+        # 預設股票清單（常見的大型股與 ETF）
+        stock_list = ['2330', '0050', '0056', '2412', '2454']
+    
+    # 將 YYYYMMDD 轉換為民國年格式，並提取月份
     try:
-        resp = session.get(url, verify=verify, timeout=timeout)
-        resp.raise_for_status()
-        text = resp.text
-        # 移除不必要的分隔線與說明列，再用 pandas 解析
-        lines = [line for line in text.splitlines() if line and not line.startswith(('=', '"'))]
-        csv_text = '\n'.join(lines)
-        df = pd.read_csv(io.StringIO(csv_text), header=0)
-        df = df.dropna(how='all').reset_index(drop=True)
-        df = _normalize_columns(df)
-        return df
-    except Exception as e:
-        logger.warning('fetch_twse 失敗: %s', e)
+        year = int(date_str[:4])
+        month = int(date_str[4:6])
+        day = int(date_str[6:8])
+        roc_year = year - 1911  # 西元轉民國
+        target_date_str = f'{roc_year:03d}/{month:02d}/{day:02d}'
+    except (ValueError, IndexError):
+        logger.error('日期格式錯誤: %s', date_str)
         return pd.DataFrame()
+    
+    all_data = []
+    for stock_id in stock_list:
+        url = TWSE_STOCK_DAY_URL.format(date=date_str, stock_id=stock_id)
+        try:
+            resp = session.get(url, verify=verify, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+            
+            if not payload.get('data'):
+                logger.debug('股票 %s 在 %s 無交易資料', stock_id, date_str)
+                continue
+            
+            # TWSE API 回傳格式：data 為列表，每筆為 [日期(民國年), 成交股數, 成交金額, 開盤價, 最高價, 最低價, 收盤價, ...]
+            # fields: ["日期","成交股數","成交金額","開盤價","最高價","最低價","收盤價","漲跌價差","成交筆數","註記"]
+            for row in payload['data']:
+                try:
+                    # 檢查日期是否符合
+                    if row[0] != target_date_str:
+                        continue
+                    
+                    # 移除逗號並轉型
+                    volume = row[1].replace(',', '') if row[1] else 0
+                    open_price = row[3].replace(',', '') if row[3] else None
+                    high_price = row[4].replace(',', '') if row[4] else None
+                    low_price = row[5].replace(',', '') if row[5] else None
+                    close_price = row[6].replace(',', '') if row[6] else None
+                    
+                    record = {
+                        '股票代號': stock_id,
+                        '股票名稱': payload.get('title', ''),
+                        '成交量': int(volume) if volume else 0,
+                        '開盤價': float(open_price) if open_price else 0.0,
+                        '最高價': float(high_price) if high_price else 0.0,
+                        '最低價': float(low_price) if low_price else 0.0,
+                        '收盤價': float(close_price) if close_price else 0.0,
+                    }
+                    all_data.append(record)
+                except (ValueError, IndexError) as e:
+                    logger.debug('解析 %s 資料失敗: %s', stock_id, e)
+                    continue
+        except Exception as e:
+            logger.debug('fetch_twse 查詢 %s 失敗: %s', stock_id, e)
+            continue
+    
+    if not all_data:
+        logger.warning('TWSE 在 %s 無任何有效資料', date_str)
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(all_data)
+    return df
 
 
 def fetch_tpex(session: requests.Session, date_str: str, verify: bool, timeout: int = 10) -> pd.DataFrame:
@@ -75,9 +126,9 @@ def fetch_tpex(session: requests.Session, date_str: str, verify: bool, timeout: 
         return pd.DataFrame()
 
 
-def fetch_data(date_str: str, verify: bool = True, timeout: int = 10) -> pd.DataFrame:
+def fetch_data(date_str: str, verify: bool = True, timeout: int = 10, stock_list: Optional[list] = None) -> pd.DataFrame:
     session = requests.Session()
-    twse_df = fetch_twse(session, date_str, verify=verify, timeout=timeout)
+    twse_df = fetch_twse(session, date_str, verify=verify, timeout=timeout, stock_list=stock_list)
     tpex_df = fetch_tpex(session, date_str, verify=verify, timeout=timeout)
 
     if twse_df.empty and tpex_df.empty:
@@ -119,24 +170,26 @@ def save_to_csv(df: pd.DataFrame, date_str: str, output_dir: Optional[str] = 'da
     return file_path
 
 
-def cli(argv=None):
+def cli(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description='抓取 TWSE & TPEx 每日交易資料並輸出 CSV')
     parser.add_argument('--date', '-d', help='日期 YYYYMMDD，預設為今日')
     parser.add_argument('--output', '-o', default='data/raw', help='輸出資料夾')
+    parser.add_argument('--stocks', help='股票代號清單（逗號分隔），預設為範本清單')
     parser.add_argument('--insecure', action='store_true', help='允許不驗證 SSL（僅測試用）')
     parser.add_argument('--timeout', type=int, default=10, help='HTTP 請求超時秒數')
     args = parser.parse_args(argv)
 
     date_str = args.date or datetime.now().strftime('%Y%m%d')
+    stock_list = args.stocks.split(',') if args.stocks else None
     verify = not args.insecure
     if not verify:
         import urllib3
 
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    df = fetch_data(date_str, verify=verify, timeout=args.timeout)
+    df = fetch_data(date_str, verify=verify, timeout=args.timeout, stock_list=stock_list)
     if df.empty:
         print('未取得任何資料。')
         return 1
